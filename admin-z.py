@@ -28,8 +28,8 @@ from collections import deque
 from datetime import datetime
 
 APP_NAME = "Admin-Z"
-APP_VERSION = "1.1.0"
-GITHUB_URL = "https://github.com/admin-z/admin-z"
+APP_VERSION = "1.1.1"
+GITHUB_URL = "https://github.com/tapeau/Admin-Z"
 WINDOW_W, WINDOW_H = 1280, 960          # default size on first launch
 WINDOW_MIN_W, WINDOW_MIN_H = 1024, 640  # smallest size that keeps layouts intact
 GRAPH_POINTS = 60  # points kept per line graph
@@ -3206,8 +3206,8 @@ class MainWindow(QMainWindow):
         for w, name in ((self.system_tab, "System"),
                         (self.hardware_tab, "Hardware"),
                         (self.network_tab, "Network"),
-                        (self.logs_tab, "Logs"),
                         (self.security_tab, "Security"),
+                        (self.logs_tab, "Logs"),
                         (self.settings_tab, "Settings")):
             self.tabs.addTab(w, name)
         self.setCentralWidget(self.tabs)
