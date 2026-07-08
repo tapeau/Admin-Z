@@ -6,7 +6,7 @@ Requests administrator privileges on startup (UAC). If elevation is denied,
 the app shows an error box and exits.
 
 Dependencies:
-    pip install PyQt6 psutil pywin32
+    pip install PyQt6 psutil pywin32 QtAwesome
 Optional:
     pip install PyYAML     (nicer YAML export; a built-in fallback is used otherwise)
 
@@ -28,9 +28,10 @@ from collections import deque
 from datetime import datetime
 
 APP_NAME = "Admin-Z"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 GITHUB_URL = "https://github.com/admin-z/admin-z"
-WINDOW_W, WINDOW_H = 1280, 960
+WINDOW_W, WINDOW_H = 1280, 960          # default size on first launch
+WINDOW_MIN_W, WINDOW_MIN_H = 1024, 640  # smallest size that keeps layouts intact
 GRAPH_POINTS = 60  # points kept per line graph
 
 IS_WINDOWS = sys.platform == "win32"
@@ -91,7 +92,8 @@ try:
                                  QListWidget, QListWidgetItem, QStackedWidget,
                                  QTableWidget, QTableWidgetItem, QHeaderView,
                                  QFrame, QScrollArea, QFileDialog, QMessageBox,
-                                 QSizePolicy, QAbstractItemView, QStyle)
+                                 QSizePolicy, QAbstractItemView, QStyle,
+                                 QProgressBar)
     from PyQt6.QtSvg import QSvgRenderer
 except ImportError:
     _fatal_box("PyQt6 is not installed.\n\nInstall dependencies with:\n"
@@ -120,11 +122,26 @@ try:
     HAS_WMI = True
 except ImportError:
     pass
+HAS_WIN32SEC = False
+try:
+    import win32api
+    import win32con
+    import win32security
+    HAS_WIN32SEC = True
+except ImportError:
+    pass
 
 try:
     import yaml as _pyyaml
 except ImportError:
     _pyyaml = None
+
+try:
+    import qtawesome as qta
+    HAS_QTA = True
+except ImportError:
+    qta = None
+    HAS_QTA = False
 
 # ---------------------------------------------------------------- settings
 
@@ -141,6 +158,7 @@ DEFAULT_SETTINGS = {
     "theme": "light",            # "light" | "dark"
     "follow_system": True,
     "refresh_ms": 1000,
+    "logs_refresh_ms": 1000,     # Logs tab + Security tab log lists
     "export_dir": os.path.join(os.path.expanduser("~"), "Desktop"),
     "always_on_top": False,
 }
@@ -168,6 +186,10 @@ def load_settings():
         s["refresh_ms"] = max(100, int(s["refresh_ms"]))
     except Exception:
         s["refresh_ms"] = 1000
+    try:
+        s["logs_refresh_ms"] = max(100, int(s["logs_refresh_ms"]))
+    except Exception:
+        s["logs_refresh_ms"] = 1000
     if not isinstance(s["export_dir"], str) or not s["export_dir"]:
         s["export_dir"] = DEFAULT_SETTINGS["export_dir"]
     s["follow_system"] = bool(s["follow_system"])
@@ -284,6 +306,11 @@ QScrollBar::add-line, QScrollBar::sub-line { height: 0; width: 0; }
 QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
 QMessageBox { background: @card; }
 QToolTip { background: @card; color: @text; border: 1px solid @border; }
+QProgressBar {
+    background: @card; border: 1px solid @border; border-radius: 6px;
+    text-align: center; color: @text; font-weight: 600;
+}
+QProgressBar::chunk { background: @accent; border-radius: 5px; }
 """
 
 
@@ -339,6 +366,29 @@ def fmt_uptime(seconds):
         parts.append(f"{h} hour{'s' if h != 1 else ''}")
     parts.append(f"{m} min{'s' if m != 1 else ''}")
     return ", ".join(parts)
+
+
+def cim_to_datetime(v):
+    """WMI/COM datetime (CIM string or PyTime) -> naive local datetime."""
+    if v is None:
+        return None
+    try:
+        if hasattr(v, "year"):  # pywintypes datetime
+            if v.year < 1990:   # WMI epoch placeholder means "never"
+                return None
+            return datetime(v.year, v.month, v.day, v.hour, v.minute,
+                            int(v.second))
+        m = re.match(r"(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})", str(v))
+        if m:
+            dt = datetime(*map(int, m.groups()))
+            return dt if dt.year >= 1990 else None
+    except Exception:
+        pass
+    return None
+
+
+def fmt_dt(dt):
+    return dt.strftime("%Y-%m-%d %H:%M:%S") if dt else "—"
 
 
 # ---------------------------------------------------------------- export serializers
@@ -1019,6 +1069,465 @@ class LogsThread(QThread):
                             continue
         events.sort(key=lambda e: e["dt"], reverse=True)
         self.loaded.emit(events[:1000])
+
+
+# ================================================================ security data
+
+AUDIT_FAILURE = 0x0010000000000000
+AUDIT_SUCCESS = 0x0020000000000000
+THREAT_STATUS = {0: "Unknown", 1: "Detected", 2: "Cleaned", 3: "Quarantined",
+                 4: "Removed", 5: "Allowed", 6: "Blocked", 102: "Not applicable",
+                 103: "Failed", 105: "Allowed", 106: "Blocked", 107: "Removed"}
+
+
+def fetch_security_events(max_total=1000, progress_cb=None):
+    """Newest Security-channel events. Returns (events, failed_logons_24h
+    keyed by username, blocked_connection_count_24h). progress_cb, when
+    given, receives 0-100 as batches are read."""
+    events, failed, blocked = [], {}, 0
+    if not HAS_EVT:
+        return events, failed, blocked
+    import xml.etree.ElementTree as ET
+    ns = {"e": "http://schemas.microsoft.com/win/2004/08/events/event"}
+    meta_cache = {}
+    now = datetime.now().astimezone()
+    try:
+        q = win32evtlog.EvtQuery(
+            "Security",
+            win32evtlog.EvtQueryChannelPath | win32evtlog.EvtQueryReverseDirection)
+    except Exception:
+        return events, failed, blocked
+    got = 0
+    while got < max_total:
+        try:
+            batch = win32evtlog.EvtNext(q, min(100, max_total - got))
+        except Exception:
+            break
+        if not batch:
+            break
+        if progress_cb:
+            progress_cb(min(100, (got + len(batch)) * 100 // max_total))
+        for h in batch:
+            got += 1
+            try:
+                root = ET.fromstring(win32evtlog.EvtRender(
+                    h, win32evtlog.EvtRenderEventXml))  # OS-generated XML
+                sysn = root.find("e:System", ns)
+                tc = sysn.find("e:TimeCreated", ns)
+                ts = (tc.get("SystemTime") if tc is not None else "") or ""
+                ts = re.sub(r"\.(\d{1,6})\d*", r".\1", ts).replace("Z", "+00:00")
+                try:
+                    dt = datetime.fromisoformat(ts).astimezone()
+                except ValueError:
+                    dt = now
+                kw_el = sysn.find("e:Keywords", ns)
+                kw = int(kw_el.text, 16) if kw_el is not None and kw_el.text else 0
+                if kw & AUDIT_FAILURE:
+                    keywords = "Audit Failure"
+                elif kw & AUDIT_SUCCESS:
+                    keywords = "Audit Success"
+                else:
+                    keywords = "Classic"
+                prov = sysn.find("e:Provider", ns)
+                pname = (prov.get("Name") if prov is not None else "") or "?"
+                eid_el = sysn.find("e:EventID", ns)
+                eid = int(eid_el.text) if eid_el is not None and eid_el.text else 0
+                task_el = sysn.find("e:Task", ns)
+                task_num = task_el.text if task_el is not None else None
+                task = None
+                meta = meta_cache.get(pname)
+                if meta is None:
+                    try:
+                        meta = win32evtlog.EvtOpenPublisherMetadata(pname)
+                    except Exception:
+                        meta = False
+                    meta_cache[pname] = meta
+                if meta:
+                    try:  # resolve the task name the way Event Viewer shows it
+                        task = win32evtlog.EvtFormatMessage(
+                            meta, h, win32evtlog.EvtFormatMessageTask).strip()
+                    except Exception:
+                        task = None
+                task = task or ("None" if task_num in (None, "0") else str(task_num))
+                recent = (now - dt).total_seconds() < 86400
+                if recent and eid == 4625:  # failed logon
+                    data_n = root.find("e:EventData", ns)
+                    if data_n is not None:
+                        for el in data_n.findall("e:Data", ns):
+                            if el.get("Name") == "TargetUserName" and el.text:
+                                u = el.text.strip().lower()
+                                if u and not u.endswith("$"):
+                                    failed[u] = failed.get(u, 0) + 1
+                                break
+                elif recent and eid in (5152, 5157):  # WFP blocked packet/conn
+                    blocked += 1
+                events.append({
+                    "keywords": keywords, "failure": bool(kw & AUDIT_FAILURE),
+                    "dt": dt, "time_str": dt.strftime("%Y-%m-%d %H:%M:%S"),
+                    "source": pname.replace("Microsoft-Windows-", ""),
+                    "event_id": eid, "task": task,
+                })
+            except Exception:
+                continue
+    events.sort(key=lambda e: e["dt"], reverse=True)
+    return events[:max_total], failed, blocked
+
+
+class SecurityThread(QThread):
+    """One-shot sweep of everything shown on the Security tab."""
+    ready = pyqtSignal(dict)
+    progress = pyqtSignal(int, str)   # percent, current stage
+
+    def run(self):
+        if HAS_WMI:
+            try:
+                pythoncom.CoInitialize()
+            except Exception:
+                pass
+        # the Security-log read is the longest stage: it spans 0-40 %
+        self.progress.emit(0, "Security logs")
+        events, failed, blocked = fetch_security_events(
+            progress_cb=lambda pct: self.progress.emit(pct * 40 // 100,
+                                                       "Security logs"))
+        self.progress.emit(40, "Windows Defender")
+        defender = self._defender()
+        self.progress.emit(55, "firewall")
+        firewall = self._firewall()
+        self.progress.emit(70, "user accounts")
+        users = self._users(failed)
+        self.progress.emit(80, "elevated processes")
+        elevated = self._elevated()
+        self.progress.emit(92, "startup programs")
+        startup = self._startup()
+        self.progress.emit(97, "UAC status")
+        uac = self._uac()
+        self.progress.emit(100, "done")
+        self.ready.emit({
+            "events": events,
+            "blocked_24h": blocked,
+            "defender": defender,
+            "firewall": firewall,
+            "users": users,
+            "elevated": elevated,
+            "startup": startup,
+            "uac": uac,
+        })
+
+    # ---- Windows Defender (root\Microsoft\Windows\Defender) --------------
+    @staticmethod
+    def _defender():
+        out = {"available": False}
+        if not HAS_WMI:
+            return out
+        try:
+            svc = _wmi_connect(r"root\Microsoft\Windows\Defender")
+            for st in svc.ExecQuery("SELECT * FROM MSFT_MpComputerStatus"):
+                out["available"] = True
+                out["protection"] = bool(st.AntivirusEnabled) and bool(st.AMServiceEnabled)
+                out["realtime"] = bool(st.RealTimeProtectionEnabled)
+                quick = cim_to_datetime(st.QuickScanEndTime)
+                full = cim_to_datetime(st.FullScanEndTime)
+                if quick and (not full or quick >= full):
+                    out["last_scan"], out["scan_type"] = quick, "Quick scan"
+                elif full:
+                    out["last_scan"], out["scan_type"] = full, "Full scan"
+                else:
+                    out["last_scan"], out["scan_type"] = None, "None"
+                out["sig_updated"] = cim_to_datetime(st.AntivirusSignatureLastUpdated)
+                try:
+                    out["sig_version"] = str(st.AntivirusSignatureVersion)
+                except Exception:
+                    out["sig_version"] = None
+                break
+        except Exception:
+            return out
+        names, active = {}, 0
+        try:
+            for t in svc.ExecQuery("SELECT * FROM MSFT_MpThreat"):
+                names[int(t.ThreatID or 0)] = str(t.ThreatName or "Unknown threat")
+                try:
+                    if t.IsActive:
+                        active += 1
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        history, quarantined = [], 0
+        try:
+            for det in svc.ExecQuery("SELECT * FROM MSFT_MpThreatDetection"):
+                sid = int(det.ThreatStatusID or 0)
+                if sid == 3:
+                    quarantined += 1
+                history.append({
+                    "name": names.get(int(det.ThreatID or 0),
+                                      f"Threat {det.ThreatID}"),
+                    "dt": cim_to_datetime(det.InitialDetectionTime),
+                    "status": THREAT_STATUS.get(sid, f"Status {sid}"),
+                })
+        except Exception:
+            pass
+        history.sort(key=lambda x: x["dt"] or datetime.min, reverse=True)
+        out["active_threats"] = active
+        out["quarantined"] = quarantined
+        out["history"] = history[:50]
+        return out
+
+    # ---- Windows Defender Firewall (HNetCfg.FwPolicy2 + registry) --------
+    @staticmethod
+    def _firewall():
+        out = {"available": False}
+        if not HAS_WMI:
+            return out
+        try:
+            fw = win32com.client.Dispatch("HNetCfg.FwPolicy2")
+            profiles = {"Domain": 1, "Private": 2, "Public": 4}
+            states = {}
+            for name, p in profiles.items():
+                try:
+                    states[name] = bool(fw.FirewallEnabled(p))
+                except Exception:
+                    states[name] = None
+            out["profiles"] = states
+            known = [v for v in states.values() if v is not None]
+            if known and all(known):
+                out["overall"] = "On"
+            elif known and not any(known):
+                out["overall"] = "Off"
+            else:
+                out["overall"] = "Partially on (see profiles)"
+            inbound = outbound = in_en = out_en = 0
+            try:
+                for rule in fw.Rules:
+                    if rule.Direction == 1:
+                        inbound += 1
+                        if rule.Enabled:
+                            in_en += 1
+                    elif rule.Direction == 2:
+                        outbound += 1
+                        if rule.Enabled:
+                            out_en += 1
+                out["inbound"] = (inbound, in_en)
+                out["outbound"] = (outbound, out_en)
+            except Exception:
+                pass
+            out["available"] = True
+        except Exception:
+            return out
+        try:  # notifications: FirewallPolicy registry (0 = show notifications)
+            import winreg
+            base = (r"SYSTEM\CurrentControlSet\Services\SharedAccess"
+                    r"\Parameters\FirewallPolicy")
+            shown = []
+            for prof in ("DomainProfile", "StandardProfile", "PublicProfile"):
+                try:
+                    k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base + "\\" + prof)
+                    val = winreg.QueryValueEx(k, "DisableNotifications")[0]
+                    winreg.CloseKey(k)
+                    shown.append(val == 0)
+                except OSError:
+                    shown.append(True)   # default is notifications on
+            out["notifications"] = "Enabled" if any(shown) else "Disabled"
+        except Exception:
+            out["notifications"] = None
+        return out
+
+    # ---- local user accounts ---------------------------------------------
+    @staticmethod
+    def _users(failed):
+        users, locked = [], []
+        if not HAS_WMI:
+            return {"accounts": users, "locked": locked}
+        try:
+            svc = _wmi_connect()
+            host = socket.gethostname()
+
+            def group_members(sid):
+                names = set()
+                try:
+                    for g in svc.ExecQuery(
+                            "SELECT Name FROM Win32_Group WHERE LocalAccount=TRUE "
+                            f"AND SID='{sid}'"):
+                        q = ("ASSOCIATORS OF {Win32_Group.Domain='%s',Name='%s'} "
+                             "WHERE ResultClass=Win32_UserAccount"
+                             % (host, g.Name))
+                        for m in svc.ExecQuery(q):
+                            names.add(str(m.Name).lower())
+                except Exception:
+                    pass
+                return names
+
+            admins = group_members("S-1-5-32-544")
+            guests = group_members("S-1-5-32-546")
+            logons = {}
+            try:
+                for lp in svc.ExecQuery(
+                        "SELECT Name, LastLogon FROM Win32_NetworkLoginProfile"):
+                    nm = str(lp.Name or "").split("\\")[-1].strip().lower()
+                    dtv = cim_to_datetime(lp.LastLogon)
+                    if nm and dtv and (nm not in logons or dtv > logons[nm]):
+                        logons[nm] = dtv
+            except Exception:
+                pass
+            for u in svc.ExecQuery(
+                    "SELECT * FROM Win32_UserAccount WHERE LocalAccount=TRUE"):
+                name = str(u.Name)
+                low = name.lower()
+                if low in admins:
+                    priv = "Administrator"
+                elif low in guests:
+                    priv = "Guest"
+                else:
+                    priv = "Standard User"
+                if u.Disabled:
+                    priv += " (disabled)"
+                users.append({"name": name, "priv": priv,
+                              "last_login": logons.get(low),
+                              "failed": failed.get(low, 0)})
+                if u.Lockout:
+                    locked.append(name)
+        except Exception:
+            pass
+        users.sort(key=lambda x: x["name"].lower())
+        return {"accounts": users, "locked": locked}
+
+    # ---- elevated processes ------------------------------------------------
+    @staticmethod
+    def _elevated():
+        out = []
+        if not HAS_WIN32SEC:
+            return out
+        for p in psutil.process_iter(["pid", "name", "username", "create_time"]):
+            pid = p.info["pid"]
+            if pid is None or pid <= 4:
+                continue
+            try:
+                h = win32api.OpenProcess(
+                    win32con.PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+                try:
+                    tok = win32security.OpenProcessToken(h, win32con.TOKEN_QUERY)
+                    elevated = bool(win32security.GetTokenInformation(
+                        tok, win32security.TokenElevation))
+                finally:
+                    h.Close()
+            except Exception:
+                continue
+            if not elevated:
+                continue
+            ct = p.info.get("create_time")
+            out.append({
+                "name": p.info.get("name") or "?",
+                "pid": pid,
+                "user": p.info.get("username") or "—",
+                "started": (datetime.fromtimestamp(ct).strftime("%Y-%m-%d %H:%M:%S")
+                            if ct else "—"),
+            })
+        out.sort(key=lambda x: x["name"].lower())
+        return out
+
+    # ---- startup programs ---------------------------------------------------
+    @staticmethod
+    def _startup():
+        approved = {}
+        try:  # StartupApproved: even first byte = enabled, odd = disabled
+            import winreg
+            base = (r"Software\Microsoft\Windows\CurrentVersion"
+                    r"\Explorer\StartupApproved")
+            for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+                for sub in ("Run", "Run32", "StartupFolder"):
+                    try:
+                        k = winreg.OpenKey(hive, base + "\\" + sub)
+                    except OSError:
+                        continue
+                    i = 0
+                    while True:
+                        try:
+                            name, val, _ = winreg.EnumValue(k, i)
+                        except OSError:
+                            break
+                        i += 1
+                        if isinstance(val, bytes) and val:
+                            approved[name.lower()] = (val[0] % 2 == 0)
+                    winreg.CloseKey(k)
+        except Exception:
+            pass
+        out = []
+        if HAS_WMI:
+            try:
+                svc = _wmi_connect()
+                for s in svc.ExecQuery("SELECT * FROM Win32_StartupCommand"):
+                    name = str(s.Name or "?")
+                    loc = str(s.Location or "")
+                    user = str(s.User or "")
+                    system_wide = ("HKLM" in loc.upper()
+                                   or "common" in loc.lower()
+                                   or user.lower() in ("public", "all users",
+                                                       "nt authority\\system"))
+                    out.append({
+                        "name": name,
+                        "cmd": str(s.Command or ""),
+                        "type": "System" if system_wide else "User",
+                        "enabled": approved.get(name.lower(), True),
+                    })
+            except Exception:
+                pass
+        out.sort(key=lambda x: x["name"].lower())
+        return out
+
+    # ---- UAC -----------------------------------------------------------------
+    @staticmethod
+    def _uac():
+        out = {"level": "Unknown", "frequency": "Unknown"}
+        try:
+            import winreg
+            k = winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System")
+
+            def rv(name, default):
+                try:
+                    return int(winreg.QueryValueEx(k, name)[0])
+                except OSError:
+                    return default
+
+            lua = rv("EnableLUA", 1)
+            consent = rv("ConsentPromptBehaviorAdmin", 5)
+            secure = rv("PromptOnSecureDesktop", 1)
+            winreg.CloseKey(k)
+            if not lua:
+                out["level"] = "Disabled (UAC is turned off)"
+                out["frequency"] = "Never notifies"
+            elif consent == 0:
+                out["level"] = "Never notify (silent elevation)"
+                out["frequency"] = "Never notifies; elevation is automatic"
+            elif consent in (1, 3):
+                out["level"] = "Prompt for everything (credentials required)"
+                out["frequency"] = ("Prompts for credentials on every elevation, "
+                                    "including Windows settings changes")
+            elif consent == 2:
+                out["level"] = ("Always notify" if secure
+                                else "Always notify (without desktop protection)")
+                out["frequency"] = ("Prompts whenever apps or the user try to "
+                                    "make changes to the computer")
+            elif consent == 5:
+                out["level"] = ("Prompt for apps (with desktop protection)" if secure
+                                else "Prompt for apps (without desktop protection)")
+                out["frequency"] = ("Prompts only when apps try to make changes; "
+                                    "not for Windows settings changes (default)")
+            else:
+                out["level"] = f"Custom (ConsentPromptBehaviorAdmin={consent})"
+                out["frequency"] = "Custom policy"
+        except Exception:
+            pass
+        return out
+
+
+class SecurityLogsThread(QThread):
+    """Periodic re-read of just the Security log (not the full sweep)."""
+    loaded = pyqtSignal(list, int)   # events, blocked_connections_24h
+
+    def run(self):
+        events, _, blocked = fetch_security_events()
+        self.loaded.emit(events, blocked)
 
 
 # ================================================================ UI primitives
@@ -1908,16 +2417,23 @@ class CheckHeader(QHeaderView):
         super().mousePressEvent(e)
 
 
-class LogsTab(QWidget):
-    HEADERS = ["", "Level", "Date and Time", "Source", "Event ID",
-               "Task Category", "Log"]
+class EventTablePanel(QWidget):
+    """Sortable event table with checkbox selection, a select-all header,
+    Shift+click range selection, and tab-separated export.
+    Shared by the Logs tab and the Security tab's log section."""
 
-    def __init__(self, get_dir, parent=None):
+    def __init__(self, headers, export_prefix, get_dir, status_suffix="",
+                 date_col=2, widths=None, stretch_col=3, extra_buttons=(),
+                 table_height=None, parent=None):
         super().__init__(parent)
+        self.headers = headers            # index 0 is the checkbox column
+        self.export_prefix = export_prefix
         self.get_dir = get_dir
+        self.status_suffix = status_suffix
+        self.date_col = date_col
         self._anchor_row = None
         v = QVBoxLayout(self)
-        v.setContentsMargins(18, 14, 18, 18)
+        v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(12)
 
         top = QHBoxLayout()
@@ -1928,14 +2444,13 @@ class LogsTab(QWidget):
         self.export_btn = QPushButton("Export selected logs")
         self.export_btn.clicked.connect(self._export)
         top.addWidget(self.export_btn)
-        evt_btn = QPushButton("Open Windows Event Manager")
-        evt_btn.clicked.connect(lambda: launch_windows_tool(self, "eventvwr.exe"))
-        top.addWidget(evt_btn)
+        for b in extra_buttons:
+            top.addWidget(b)
         v.addLayout(top)
 
-        t = QTableWidget(0, len(self.HEADERS))
+        t = QTableWidget(0, len(headers))
         self.table = t
-        t.setHorizontalHeaderLabels(self.HEADERS)
+        t.setHorizontalHeaderLabels(headers)
         self.check_header = CheckHeader(t)
         t.setHorizontalHeader(self.check_header)
         self.check_header.toggled.connect(self._select_all)
@@ -1948,64 +2463,63 @@ class LogsTab(QWidget):
         t.setWordWrap(False)
         hdr = t.horizontalHeader()
         hdr.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
-        t.setColumnWidth(0, 34)
-        t.setColumnWidth(1, 105)
-        t.setColumnWidth(2, 160)
-        t.setColumnWidth(4, 80)
-        t.setColumnWidth(5, 130)
-        t.setColumnWidth(6, 100)
+        hdr.setSectionResizeMode(stretch_col, QHeaderView.ResizeMode.Stretch)
+        for c, w in (widths or {}).items():
+            t.setColumnWidth(c, w)
+        if table_height:
+            t.setFixedHeight(table_height)
         t.itemClicked.connect(self._on_item_clicked)
         t.itemChanged.connect(self._on_item_changed)
         v.addWidget(t, 1)
 
-    def set_logs(self, events):
+    @staticmethod
+    def _row_uid(row):
+        return (row["dt"], tuple(row["cells"]))
+
+    def set_rows(self, rows):
+        """rows: dicts with 'cells' (str per column after the checkbox),
+        'keys' (sort keys), 'dt', optional 'color' (col 1) and 'export'.
+        Checked rows and the active sort survive periodic refreshes."""
         t = self.table
+        if getattr(self, "_loaded", False):
+            hdr = t.horizontalHeader()
+            sort_col = hdr.sortIndicatorSection()
+            sort_ord = hdr.sortIndicatorOrder()
+            if sort_col <= 0:
+                sort_col, sort_ord = self.date_col, Qt.SortOrder.DescendingOrder
+        else:
+            sort_col, sort_ord = self.date_col, Qt.SortOrder.DescendingOrder
+        checked = set()
+        for r in range(t.rowCount()):
+            it = t.item(r, 0)
+            if it and it.checkState() == Qt.CheckState.Checked:
+                rec = it.data(Qt.ItemDataRole.UserRole + 1)
+                if rec:
+                    checked.add(self._row_uid(rec))
         t.setSortingEnabled(False)
         t.blockSignals(True)
-        t.setRowCount(len(events))
-        level_colors = {1: PAL["crit"], 2: PAL["err"], 3: PAL["warn"]}
-        for r, e in enumerate(events):
+        t.setRowCount(len(rows))
+        for r, row in enumerate(rows):
+            keep = self._row_uid(row) in checked
             chk = SortItem("")
             chk.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
                          | Qt.ItemFlag.ItemIsUserCheckable)
-            chk.setCheckState(Qt.CheckState.Unchecked)
-            chk.setData(Qt.ItemDataRole.UserRole, 0)
-            chk.setData(Qt.ItemDataRole.UserRole + 1, e)   # full event record
+            chk.setCheckState(Qt.CheckState.Checked if keep
+                              else Qt.CheckState.Unchecked)
+            chk.setData(Qt.ItemDataRole.UserRole, 1 if keep else 0)
+            chk.setData(Qt.ItemDataRole.UserRole + 1, row)   # full record
             t.setItem(r, 0, chk)
-
-            lvl = SortItem(("● " if e["level_num"] in level_colors else "") + e["level"])
-            lvl.setData(Qt.ItemDataRole.UserRole, e["level_num"])
-            if e["level_num"] in level_colors:
-                lvl.setForeground(QColor(level_colors[e["level_num"]]))
-            t.setItem(r, 1, lvl)
-
-            dt = SortItem(e["time_str"])
-            dt.setData(Qt.ItemDataRole.UserRole, e["dt"].timestamp())
-            t.setItem(r, 2, dt)
-
-            src = SortItem(e["source"])
-            src.setData(Qt.ItemDataRole.UserRole, e["source"].lower())
-            t.setItem(r, 3, src)
-
-            eid = SortItem(str(e["event_id"]))
-            eid.setData(Qt.ItemDataRole.UserRole, e["event_id"])
-            t.setItem(r, 4, eid)
-
-            task = SortItem(e["task"])
-            task.setData(Qt.ItemDataRole.UserRole, e["task"])
-            t.setItem(r, 5, task)
-
-            ch = SortItem(e["channel"])
-            ch.setData(Qt.ItemDataRole.UserRole, e["channel"])
-            t.setItem(r, 6, ch)
+            for c, (text, key) in enumerate(zip(row["cells"], row["keys"]), start=1):
+                it = SortItem(str(text))
+                it.setData(Qt.ItemDataRole.UserRole, key)
+                if c == 1 and row.get("color"):
+                    it.setForeground(QColor(row["color"]))
+                t.setItem(r, c, it)
         t.blockSignals(False)
         t.setSortingEnabled(True)
-        t.sortItems(2, Qt.SortOrder.DescendingOrder)  # newest first, like Event Viewer
+        t.sortItems(sort_col, sort_ord)
+        self._loaded = True
         self._update_status()
-        if not HAS_EVT:
-            self.status.setText("pywin32 is required to read the Windows Event Log "
-                                "(pip install pywin32).")
 
     # ---- selection ------------------------------------------------------
     def _on_item_clicked(self, item):
@@ -2047,7 +2561,7 @@ class LogsTab(QWidget):
         self._anchor_row = None
         self._update_status()
 
-    def _checked_events(self):
+    def _checked_rows(self):
         out = []
         for r in range(self.table.rowCount()):
             it = self.table.item(r, 0)
@@ -2057,26 +2571,24 @@ class LogsTab(QWidget):
 
     def _update_status(self):
         n = self.table.rowCount()
-        sel = len(self._checked_events())
-        self.status.setText(f"{n} logs loaded (Application, Setup, System) — {sel} selected")
+        sel = len(self._checked_rows())
+        self.status.setText(f"{n} logs loaded{self.status_suffix} — {sel} selected")
         self.check_header.set_checked_silent(n > 0 and sel == n)
 
     # ---- export ---------------------------------------------------------
     def _export(self):
-        events = self._checked_events()
-        if not events:
+        rows = self._checked_rows()
+        if not rows:
             QMessageBox.warning(self, APP_NAME,
                                 "Select at least one log entry to export (use the "
                                 "checkboxes; Shift+click selects a range).")
             return
-        newest = max(e["dt"] for e in events)   # from the "Date and Time" column
-        filename = "logs_" + newest.strftime("%Y-%m-%d_%H-%M-%S") + ".txt"
-        headers = ["Level", "Date and Time", "Source", "Event ID",
-                   "Task Category", "Log"]
-        lines = ["\t".join(headers)]
-        for e in events:
-            lines.append("\t".join([e["level"], e["time_str"], e["source"],
-                                    str(e["event_id"]), e["task"], e["channel"]]))
+        newest = max(r["dt"] for r in rows)   # from the "Date and Time" column
+        filename = (self.export_prefix
+                    + newest.strftime("%Y-%m-%d_%H-%M-%S") + ".txt")
+        lines = ["\t".join(self.headers[1:])]
+        for r in rows:
+            lines.append("\t".join(str(x) for x in r.get("export", r["cells"])))
         try:
             directory = self.get_dir()
             os.makedirs(directory, exist_ok=True)
@@ -2087,8 +2599,374 @@ class LogsTab(QWidget):
             return
         QMessageBox.information(
             self, "Export successful",
-            f"{len(events)} log entr{'y was' if len(events) == 1 else 'ies were'} "
+            f"{len(rows)} log entr{'y was' if len(rows) == 1 else 'ies were'} "
             f"exported successfully as “{filename}”.")
+
+
+class LogsTab(QWidget):
+    def __init__(self, get_dir, parent=None):
+        super().__init__(parent)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(18, 14, 18, 18)
+        v.setSpacing(12)
+        evt_btn = QPushButton("Open Windows Event Manager")
+        evt_btn.clicked.connect(lambda: launch_windows_tool(self, "eventvwr.exe"))
+        self.refresh_btn = QPushButton("Refresh")   # wired up by MainWindow
+        self.panel = EventTablePanel(
+            headers=["", "Level", "Date and Time", "Source", "Event ID",
+                     "Task Category", "Log"],
+            export_prefix="logs_", get_dir=get_dir,
+            status_suffix=" (Application, Setup, System)",
+            widths={0: 34, 1: 105, 2: 160, 4: 80, 5: 130, 6: 100},
+            stretch_col=3, extra_buttons=(evt_btn, self.refresh_btn))
+        v.addWidget(self.panel)
+
+    def set_logs(self, events):
+        colors = {1: PAL["crit"], 2: PAL["err"], 3: PAL["warn"]}
+        rows = []
+        for e in events:
+            rows.append({
+                "cells": [("● " if e["level_num"] in colors else "") + e["level"],
+                          e["time_str"], e["source"], str(e["event_id"]),
+                          e["task"], e["channel"]],
+                "keys": [e["level_num"], e["dt"].timestamp(),
+                         e["source"].lower(), e["event_id"], e["task"],
+                         e["channel"]],
+                "color": colors.get(e["level_num"]),
+                "dt": e["dt"],
+                "export": [e["level"], e["time_str"], e["source"],
+                           str(e["event_id"]), e["task"], e["channel"]],
+            })
+        self.panel.set_rows(rows)
+        if not HAS_EVT:
+            self.panel.status.setText(
+                "pywin32 is required to read the Windows Event Log "
+                "(pip install pywin32).")
+
+
+# ================================================================ Security tab
+
+def make_info_table(headers, height):
+    t = QTableWidget(0, len(headers))
+    t.setHorizontalHeaderLabels(headers)
+    t.verticalHeader().setVisible(False)
+    t.verticalHeader().setDefaultSectionSize(24)
+    t.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+    t.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+    t.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+    t.setAlternatingRowColors(True)
+    t.setShowGrid(False)
+    t.setWordWrap(False)
+    t.setFixedHeight(height)
+    hdr = t.horizontalHeader()
+    for i in range(len(headers)):
+        hdr.setSectionResizeMode(i, QHeaderView.ResizeMode.Stretch)
+    return t
+
+
+def fill_info_table(t, rows):
+    t.setRowCount(len(rows))
+    for r, cols in enumerate(rows):
+        for c, text in enumerate(cols):
+            it = QTableWidgetItem(str(text))
+            it.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            t.setItem(r, c, it)
+
+
+class SecurityTab(QWidget):
+    """Security logs, Defender, firewall, accounts, elevated processes,
+    startup programs, and UAC status."""
+
+    def __init__(self, get_dir, parent=None):
+        super().__init__(parent)
+        self.get_dir = get_dir
+        self._thread = None
+        self._log_thread = None
+        self._fw_available = False
+        v = QVBoxLayout(self)
+        v.setContentsMargins(18, 14, 18, 18)
+        v.setSpacing(12)
+
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.clicked.connect(self.refresh)
+        evt_btn = QPushButton("Open Windows Event Manager")
+        evt_btn.clicked.connect(lambda: launch_windows_tool(self, "eventvwr.exe"))
+        self.log_panel = EventTablePanel(
+            headers=["", "Keywords", "Date and Time", "Source", "Event ID",
+                     "Task Category"],
+            export_prefix="security_logs_", get_dir=get_dir,
+            status_suffix=" (Security)",
+            widths={0: 34, 1: 120, 2: 160, 3: 280, 4: 90},
+            stretch_col=5, table_height=420,
+            extra_buttons=(evt_btn, refresh_btn))
+
+        # page 0: full-screen centered loading view (text / bar / percentage)
+        self.stack = QStackedWidget()
+        load_page = QWidget()
+        lv = QVBoxLayout(load_page)
+        lv.addStretch(1)
+        self.loading_label = QLabel("Loading security information…")
+        self.loading_label.setObjectName("big")
+        self.loading_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        lv.addWidget(self.loading_label, 0, Qt.AlignmentFlag.AlignHCenter)
+        lv.addSpacing(16)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setTextVisible(False)  # percentage shown below
+        self.progress_bar.setFixedSize(420, 14)
+        lv.addWidget(self.progress_bar, 0, Qt.AlignmentFlag.AlignHCenter)
+        lv.addSpacing(10)
+        self.percent_label = QLabel("0%")
+        self.percent_label.setObjectName("dim")
+        self.percent_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        lv.addWidget(self.percent_label, 0, Qt.AlignmentFlag.AlignHCenter)
+        lv.addStretch(1)
+        self.stack.addWidget(load_page)
+
+        # page 1: the actual tab content
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        container = QWidget()
+        col = QVBoxLayout(container)
+        col.setContentsMargins(0, 0, 6, 0)
+        col.setSpacing(12)
+
+        log_card = Card("Security logs")
+        log_card.v.addWidget(self.log_panel)
+        col.addWidget(log_card)
+
+        def_card = Card()
+        hdr = QHBoxLayout()
+        tl = QLabel("Windows Defender")
+        tl.setObjectName("cardTitle")
+        hdr.addWidget(tl)
+        hdr.addStretch(1)
+        defsec_btn = QPushButton("Open Windows Security")
+        defsec_btn.clicked.connect(
+            lambda: launch_windows_tool(self, "explorer.exe", "windowsdefender:"))
+        hdr.addWidget(defsec_btn)
+        def_card.v.addLayout(hdr)
+        self.def_grid = InfoGrid()
+        for label in ("Protection status", "Real-time protection", "Last scan",
+                      "Last scan type", "Signature/definition update",
+                      "Current threats detected", "Quarantined items"):
+            self.def_grid.add(label)
+        def_card.v.addWidget(self.def_grid)
+        hist_lab = QLabel("Threat history")
+        hist_lab.setObjectName("dim")
+        def_card.v.addWidget(hist_lab)
+        self.threat_table = make_info_table(["Threat name", "Detected", "Status"], 150)
+        def_card.v.addWidget(self.threat_table)
+        col.addWidget(def_card)
+
+        fw_card = Card()
+        hdr = QHBoxLayout()
+        tl = QLabel("Windows Defender Firewall")
+        tl.setObjectName("cardTitle")
+        hdr.addWidget(tl)
+        hdr.addStretch(1)
+        fwset_btn = QPushButton("Open Windows Defender Firewall settings")
+        fwset_btn.clicked.connect(   # opens WDF with Advanced Security (wf.msc)
+            lambda: launch_windows_tool(self, "mmc.exe", "wf.msc"))
+        hdr.addWidget(fwset_btn)
+        fw_card.v.addLayout(hdr)
+        self.fw_grid = InfoGrid()
+        for label in ("Overall firewall status", "Domain profile",
+                      "Private profile", "Public profile", "Inbound rules",
+                      "Outbound rules", "Notifications",
+                      "Recently blocked connections"):
+            self.fw_grid.add(label)
+        fw_card.v.addWidget(self.fw_grid)
+        col.addWidget(fw_card)
+
+        users_card = Card("User Accounts & Sessions")
+        self.users_table = make_info_table(
+            ["Username", "Privilege level", "Last login", "Failed logins (24 h)"], 210)
+        users_card.v.addWidget(self.users_table)
+        self.locked_lab = QLabel("Locked-out accounts: —")
+        self.locked_lab.setObjectName("dim")
+        users_card.v.addWidget(self.locked_lab)
+        col.addWidget(users_card)
+
+        elev_card = Card("Running Processes with Elevated Privileges")
+        self.elev_table = make_info_table(
+            ["Process name", "PID", "User account", "Start time"], 240)
+        elev_card.v.addWidget(self.elev_table)
+        col.addWidget(elev_card)
+
+        start_card = Card("Startup Programs")
+        self.start_table = make_info_table(
+            ["Program name", "Executable path", "Status", "Startup type"], 240)
+        start_card.v.addWidget(self.start_table)
+        col.addWidget(start_card)
+
+        uac_card = Card("UAC (User Account Control) Status")
+        self.uac_grid = InfoGrid()
+        self.uac_grid.add("Current UAC level")
+        self.uac_grid.add("Notification frequency")
+        uac_card.v.addWidget(self.uac_grid)
+        col.addWidget(uac_card)
+        col.addStretch(1)
+
+        scroll.setWidget(container)
+        self.stack.addWidget(scroll)
+        v.addWidget(self.stack)
+        self.refresh()
+
+    # ---- data -----------------------------------------------------------
+    def refresh(self):
+        """Full security sweep, shown behind the centered loading view."""
+        if self._thread is not None and self._thread.isRunning():
+            return
+        self.loading_label.setText("Loading security information…")
+        self.progress_bar.setValue(0)
+        self.percent_label.setText("0%")
+        self.stack.setCurrentIndex(0)
+        self._thread = SecurityThread(self)
+        self._thread.progress.connect(self._on_progress)
+        self._thread.ready.connect(self.set_data)
+        self._thread.start()
+
+    def refresh_logs_only(self):
+        """Timer-driven re-read of the Security log list alone."""
+        if self._thread is not None and self._thread.isRunning():
+            return
+        if self._log_thread is not None and self._log_thread.isRunning():
+            return
+        self._log_thread = SecurityLogsThread(self)
+        self._log_thread.loaded.connect(self._on_logs_refreshed)
+        self._log_thread.start()
+
+    def _on_logs_refreshed(self, events, blocked):
+        self._set_log_rows(events)
+        self._set_blocked(blocked)
+
+    def _on_progress(self, pct, stage):
+        self.progress_bar.setValue(pct)
+        self.percent_label.setText(f"{pct}%")
+        if pct < 100:
+            self.loading_label.setText(
+                f"Loading security information — {stage}…")
+
+    def shutdown(self):
+        for th in (self._thread, self._log_thread):
+            if th is not None and th.isRunning():
+                th.wait(3000)
+
+    def _set_log_rows(self, events):
+        rows = []
+        for e in events or []:
+            rows.append({
+                "cells": [("● " if e["failure"] else "") + e["keywords"],
+                          e["time_str"], e["source"], str(e["event_id"]),
+                          e["task"]],
+                "keys": [e["keywords"], e["dt"].timestamp(), e["source"].lower(),
+                         e["event_id"], e["task"]],
+                "color": PAL["err"] if e["failure"] else None,
+                "dt": e["dt"],
+                "export": [e["keywords"], e["time_str"], e["source"],
+                           str(e["event_id"]), e["task"]],
+            })
+        self.log_panel.set_rows(rows)
+        if not rows:
+            self.log_panel.status.setText(
+                "No Security events available (reading the Security log "
+                "requires administrator privileges and pywin32).")
+
+    def _set_blocked(self, blocked):
+        if not self._fw_available:
+            return   # firewall grid shows "Unavailable" everywhere
+        self.fw_grid.set(
+            "Recently blocked connections",
+            f"{blocked} in the last 24 h (from the Security log)" if blocked
+            else "None recorded (or WFP auditing is disabled)")
+
+    def set_data(self, data):
+        self.stack.setCurrentIndex(1)   # show the tab content again
+        self._set_log_rows(data.get("events"))
+
+        # ---- Defender
+        dfd = data.get("defender") or {}
+        g = self.def_grid
+        if not dfd.get("available"):
+            for label in ("Protection status", "Real-time protection", "Last scan",
+                          "Last scan type", "Signature/definition update",
+                          "Current threats detected", "Quarantined items"):
+                g.set(label, "Unavailable")
+            fill_info_table(self.threat_table, [("Windows Defender data is "
+                                                 "unavailable on this system", "", "")])
+        else:
+            g.set("Protection status",
+                  "Active" if dfd.get("protection") else "Inactive")
+            g.set("Real-time protection",
+                  "Active" if dfd.get("realtime") else "Inactive")
+            g.set("Last scan", fmt_dt(dfd.get("last_scan")))
+            g.set("Last scan type", dfd.get("scan_type") or "None")
+            sig = fmt_dt(dfd.get("sig_updated"))
+            if dfd.get("sig_version"):
+                sig += f"  (version {dfd['sig_version']})"
+            g.set("Signature/definition update", sig)
+            g.set("Current threats detected",
+                  str(dfd.get("active_threats") or 0) or "0")
+            g.set("Quarantined items", str(dfd.get("quarantined") or 0))
+            hist = [(h["name"], fmt_dt(h["dt"]), h["status"])
+                    for h in (dfd.get("history") or [])]
+            fill_info_table(self.threat_table,
+                            hist or [("No threats recorded", "", "")])
+
+        # ---- firewall
+        fw = data.get("firewall") or {}
+        g = self.fw_grid
+        self._fw_available = bool(fw.get("available"))
+        if not self._fw_available:
+            for label in ("Overall firewall status", "Domain profile",
+                          "Private profile", "Public profile", "Inbound rules",
+                          "Outbound rules", "Notifications",
+                          "Recently blocked connections"):
+                g.set(label, "Unavailable")
+        else:
+            g.set("Overall firewall status", fw.get("overall") or "Unknown")
+            profiles = fw.get("profiles") or {}
+            for prof in ("Domain", "Private", "Public"):
+                st = profiles.get(prof)
+                g.set(f"{prof} profile",
+                      "On" if st else ("Off" if st is not None else "Unknown"))
+            for key, label in (("inbound", "Inbound rules"),
+                               ("outbound", "Outbound rules")):
+                pair = fw.get(key)
+                g.set(label, f"{pair[0]} rules ({pair[1]} enabled)" if pair else "—")
+            g.set("Notifications", fw.get("notifications") or "Unknown")
+            self._set_blocked(data.get("blocked_24h") or 0)
+
+        # ---- user accounts
+        users = (data.get("users") or {}).get("accounts") or []
+        fill_info_table(self.users_table,
+                        [(u["name"], u["priv"], fmt_dt(u["last_login"]),
+                          str(u["failed"])) for u in users]
+                        or [("No local accounts found", "", "", "")])
+        locked = (data.get("users") or {}).get("locked") or []
+        self.locked_lab.setText(
+            "Locked-out accounts: " + (", ".join(locked) if locked else "none"))
+
+        # ---- elevated processes
+        elev = data.get("elevated") or []
+        fill_info_table(self.elev_table,
+                        [(p["name"], str(p["pid"]), p["user"], p["started"])
+                         for p in elev]
+                        or [("No elevated processes visible", "", "", "")])
+
+        # ---- startup programs
+        start = data.get("startup") or []
+        fill_info_table(self.start_table,
+                        [(s["name"], s["cmd"],
+                          "Enabled" if s["enabled"] else "Disabled", s["type"])
+                         for s in start]
+                        or [("No startup programs found", "", "", "")])
+
+        # ---- UAC
+        uac = data.get("uac") or {}
+        self.uac_grid.set("Current UAC level", uac.get("level") or "Unknown")
+        self.uac_grid.set("Notification frequency", uac.get("frequency") or "Unknown")
 
 
 # ================================================================ Settings tab
@@ -2096,7 +2974,7 @@ class LogsTab(QWidget):
 ABOUT_TEXT = (f"{APP_NAME} {APP_VERSION} is a lightweight system administration "
               "dashboard for Windows 10 and 11. It brings live hardware telemetry, "
               "network adapter monitoring, and the Windows Event Log together in a "
-              "single, minimal window — with one-click exports to JSON, XML, and "
+              "single, minimal window, with one-click exports to JSON, XML, and "
               "YAML for reporting and support workflows. Built with Python, PyQt6, "
               "and psutil.")
 
@@ -2108,7 +2986,12 @@ class SettingsTab(QWidget):
     def __init__(self, settings, parent=None):
         super().__init__(parent)
         self.s = settings
-        v = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        container = QWidget()
+        v = QVBoxLayout(container)
         v.setContentsMargins(120, 24, 120, 24)
         v.setSpacing(14)
 
@@ -2136,8 +3019,8 @@ class SettingsTab(QWidget):
         # ---- data refresh
         dc = Card("Data")
         row = QHBoxLayout()
-        lab = QLabel("Data refresh rate (milliseconds) — applies to Hardware and "
-                     "Network graphs and to the network connection lists")
+        lab = QLabel("Data refresh rate in milliseconds (applies to Hardware and "
+                     "Network graphs and to the network connection lists)")
         lab.setObjectName("dim")
         lab.setWordWrap(True)
         row.addWidget(lab, 1)
@@ -2148,6 +3031,20 @@ class SettingsTab(QWidget):
         self.refresh_edit.setAlignment(Qt.AlignmentFlag.AlignRight)
         self.refresh_edit.editingFinished.connect(self._refresh_changed)
         row.addWidget(self.refresh_edit)
+        dc.v.addLayout(row)
+        row = QHBoxLayout()
+        lab = QLabel("Logs refresh rate in milliseconds) (applies to the log "
+                     "lists in the Logs and Security tabs)")
+        lab.setObjectName("dim")
+        lab.setWordWrap(True)
+        row.addWidget(lab, 1)
+        row.addStretch(1)
+        self.logs_refresh_edit = QLineEdit(str(self.s["logs_refresh_ms"]))
+        self.logs_refresh_edit.setValidator(QIntValidator(1, 3600000, self))
+        self.logs_refresh_edit.setFixedWidth(90)
+        self.logs_refresh_edit.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self.logs_refresh_edit.editingFinished.connect(self._logs_refresh_changed)
+        row.addWidget(self.logs_refresh_edit)
         dc.v.addLayout(row)
         v.addWidget(dc)
 
@@ -2197,6 +3094,8 @@ class SettingsTab(QWidget):
         ab.v.addWidget(self.github, 0, Qt.AlignmentFlag.AlignHCenter)
         v.addWidget(ab)
         v.addStretch(1)
+        scroll.setWidget(container)
+        outer.addWidget(scroll)
 
     # ---- handlers (live-apply; persisted by Save or on app close) -------
     def _theme_changed(self, idx):
@@ -2214,6 +3113,14 @@ class SettingsTab(QWidget):
         except ValueError:
             pass
         self.refresh_edit.setText(str(self.s["refresh_ms"]))
+        self.changed.emit()
+
+    def _logs_refresh_changed(self):
+        try:
+            self.s["logs_refresh_ms"] = max(100, int(self.logs_refresh_edit.text()))
+        except ValueError:
+            pass
+        self.logs_refresh_edit.setText(str(self.s["logs_refresh_ms"]))
         self.changed.emit()
 
     def _dir_changed(self):
@@ -2237,6 +3144,10 @@ class SettingsTab(QWidget):
         self._dir_changed()
         try:
             self.s["refresh_ms"] = max(100, int(self.refresh_edit.text()))
+        except ValueError:
+            pass
+        try:
+            self.s["logs_refresh_ms"] = max(100, int(self.logs_refresh_edit.text()))
         except ValueError:
             pass
 
@@ -2279,27 +3190,24 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.s = settings
         self.setWindowTitle(APP_NAME)
-        self.setFixedSize(WINDOW_W, WINDOW_H)      # fixed 1280x960
-        flags = (Qt.WindowType.Window
-                 | Qt.WindowType.WindowTitleHint
-                 | Qt.WindowType.WindowSystemMenuHint
-                 | Qt.WindowType.WindowMinimizeButtonHint
-                 | Qt.WindowType.WindowCloseButtonHint)   # no maximize
+        self.setMinimumSize(WINDOW_MIN_W, WINDOW_MIN_H)
+        self.resize(WINDOW_W, WINDOW_H)
         if self.s["always_on_top"]:
-            flags |= Qt.WindowType.WindowStaysOnTopHint
-        self.setWindowFlags(flags)
+            self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
 
         get_dir = lambda: self.s["export_dir"]
         self.tabs = QTabWidget()
         self.system_tab = SystemTab()
         self.hardware_tab = HardwareTab(get_dir)
         self.network_tab = NetworkTab(get_dir)
+        self.security_tab = SecurityTab(get_dir)
         self.logs_tab = LogsTab(get_dir)
         self.settings_tab = SettingsTab(self.s)
         for w, name in ((self.system_tab, "System"),
                         (self.hardware_tab, "Hardware"),
                         (self.network_tab, "Network"),
                         (self.logs_tab, "Logs"),
+                        (self.security_tab, "Security"),
                         (self.settings_tab, "Settings")):
             self.tabs.addTab(w, name)
         self.setCentralWidget(self.tabs)
@@ -2312,11 +3220,18 @@ class MainWindow(QMainWindow):
         self.metrics.sample.connect(self._on_sample)
         self.specs_thread = SpecsThread(self)
         self.specs_thread.ready.connect(self._on_specs)
-        self.logs_thread = LogsThread(self)
-        self.logs_thread.loaded.connect(self.logs_tab.set_logs)
         self.specs_thread.start()
-        self.logs_thread.start()
         self.metrics.start()
+
+        # ---- log refresh: initial load + user-defined interval + manual button
+        self._logs_thread = None
+        self._refresh_logs()
+        self.logs_tab.refresh_btn.clicked.connect(self._refresh_logs)
+        self.logs_timer = QTimer(self)
+        self.logs_timer.timeout.connect(self._refresh_logs)
+        self.seclog_timer = QTimer(self)
+        self.seclog_timer.timeout.connect(self.security_tab.refresh_logs_only)
+        self._apply_log_timers()
 
         try:  # live-follow OS light/dark switches (Qt >= 6.5)
             QApplication.styleHints().colorSchemeChanged.connect(self._on_scheme_changed)
@@ -2325,6 +3240,18 @@ class MainWindow(QMainWindow):
         self.apply_theme()
 
     # ---- data plumbing --------------------------------------------------
+    def _refresh_logs(self):
+        if self._logs_thread is not None and self._logs_thread.isRunning():
+            return
+        self._logs_thread = LogsThread(self)
+        self._logs_thread.loaded.connect(self.logs_tab.set_logs)
+        self._logs_thread.start()
+
+    def _apply_log_timers(self):
+        ms = max(100, int(self.s["logs_refresh_ms"]))
+        self.logs_timer.start(ms)
+        self.seclog_timer.start(ms)
+
     def _on_specs(self, specs):
         self.system_tab.set_specs(specs)
         self.hardware_tab.set_specs(specs)
@@ -2343,6 +3270,7 @@ class MainWindow(QMainWindow):
 
     def _apply_live_settings(self):
         self.metrics.interval = self.s["refresh_ms"]
+        self._apply_log_timers()
         want_top = self.s["always_on_top"]
         have_top = bool(self.windowFlags() & Qt.WindowType.WindowStaysOnTopHint)
         if want_top != have_top:
@@ -2361,6 +3289,29 @@ class MainWindow(QMainWindow):
         self.system_tab.retheme()
         self.settings_tab.github.refresh_icon()
         self.setWindowIcon(self._make_icon())
+        self._apply_tab_icons()
+
+    # FontAwesome 6 names, with FA5 fallbacks for older QtAwesome versions
+    TAB_ICON_NAMES = (("fa6b.windows", "fa5b.windows"),
+                      ("fa6s.microchip", "fa5s.microchip"),
+                      ("fa6s.network-wired", "fa5s.network-wired"),
+                      ("fa6s.shield-halved", "fa5s.shield-alt"),
+                      ("fa6s.file-lines", "fa5s.file-alt"),
+                      ("fa6s.gear", "fa5s.cog"))
+
+    def _apply_tab_icons(self):
+        """Vector tab icons colored from the active palette (light/dark)."""
+        if not HAS_QTA:
+            return
+        self.tabs.setIconSize(QSize(18, 18))
+        for i, names in enumerate(self.TAB_ICON_NAMES):
+            for name in names:
+                try:
+                    self.tabs.setTabIcon(i, qta.icon(
+                        name, color=PAL["text"], color_active=PAL["accent"]))
+                    break
+                except Exception:
+                    continue
 
     def _make_icon(self):
         pix = QPixmap(64, 64)
@@ -2378,10 +3329,13 @@ class MainWindow(QMainWindow):
     def closeEvent(self, ev):
         self.settings_tab.sync()
         save_settings(self.s)          # auto-save changed settings on close
+        self.logs_timer.stop()
+        self.seclog_timer.stop()
         self.metrics.stop()
         self.metrics.wait(3000)
-        for th in (self.specs_thread, self.logs_thread):
-            if th.isRunning():
+        self.security_tab.shutdown()
+        for th in (self.specs_thread, self._logs_thread):
+            if th is not None and th.isRunning():
                 th.wait(1000)
         super().closeEvent(ev)
 

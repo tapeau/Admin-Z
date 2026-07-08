@@ -1,2 +1,29 @@
+# Python
 __pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# PyInstaller / packaging
+build/
+dist/
+*.spec
+
+# Runtime user configuration (created next to the app on first close)
 settings.json
+
+# Exported artifacts (default export names, in case they land in the repo)
+hardware_specs.*
+network_specs.*
+logs_*.txt
+security_logs_*.txt
+
+# Editors / IDEs
+.vscode/
+.idea/
+
+# Windows
+Thumbs.db
+Desktop.ini
