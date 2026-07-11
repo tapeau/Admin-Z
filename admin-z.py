@@ -19,7 +19,6 @@ import json
 import os
 import platform
 import re
-import shutil
 import socket
 import subprocess
 import sys
@@ -28,7 +27,7 @@ from collections import deque
 from datetime import datetime
 
 APP_NAME = "Admin-Z"
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.2.0"
 GITHUB_URL = "https://github.com/tapeau/Admin-Z"
 WINDOW_W, WINDOW_H = 1280, 960          # default size on first launch
 WINDOW_MIN_W, WINDOW_MIN_H = 1024, 640  # smallest size that keeps layouts intact
@@ -186,8 +185,8 @@ def load_settings():
         s["refresh_ms"] = max(100, int(s["refresh_ms"]))
     except Exception:
         s["refresh_ms"] = 1000
-    try:
-        s["logs_refresh_ms"] = max(100, int(s["logs_refresh_ms"]))
+    try:  # 500 ms floor: each log refresh re-reads 1000+ events from the OS
+        s["logs_refresh_ms"] = max(500, int(s["logs_refresh_ms"]))
     except Exception:
         s["logs_refresh_ms"] = 1000
     if not isinstance(s["export_dir"], str) or not s["export_dir"]:
@@ -198,9 +197,11 @@ def load_settings():
 
 
 def save_settings(s):
-    try:
-        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+    try:  # atomic write: a crash mid-save must not corrupt settings.json
+        tmp = SETTINGS_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(s, f, indent=2)
+        os.replace(tmp, SETTINGS_PATH)
         return True
     except Exception:
         return False
@@ -761,6 +762,18 @@ class SpecsThread(QThread):
         self.ready.emit(specs)
 
 
+def _find_nvidia_smi():
+    """Locate nvidia-smi in trusted directories only. This app runs elevated,
+    so resolving executables through PATH would invite binary planting."""
+    windir = os.environ.get("SystemRoot", r"C:\Windows")
+    pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+    for cand in (os.path.join(windir, "System32", "nvidia-smi.exe"),
+                 os.path.join(pf, "NVIDIA Corporation", "NVSMI", "nvidia-smi.exe")):
+        if os.path.exists(cand):
+            return cand
+    return None
+
+
 class MetricsThread(QThread):
     """Background sampler for everything that changes per refresh tick."""
     sample = pyqtSignal(dict)
@@ -771,7 +784,8 @@ class MetricsThread(QThread):
         self._stop = False
         self.disk_map = {}          # physical index -> [mountpoints]
         self._cpu_temp_ok = True
-        self._gpu_temp_ok = shutil.which("nvidia-smi") is not None
+        self._nvidia_smi = _find_nvidia_smi()
+        self._gpu_temp_ok = self._nvidia_smi is not None
         self._last_temps = (None, [])
         self._last_temp_t = 0.0
         self._wmi_thermal = None
@@ -807,7 +821,7 @@ class MetricsThread(QThread):
             return []
         try:
             out = subprocess.run(
-                ["nvidia-smi", "--query-gpu=temperature.gpu",
+                [self._nvidia_smi, "--query-gpu=temperature.gpu",
                  "--format=csv,noheader,nounits"],
                 capture_output=True, text=True, timeout=3,
                 creationflags=0x08000000)  # CREATE_NO_WINDOW
@@ -919,7 +933,8 @@ class MetricsThread(QThread):
                 except Exception:
                     ghz = 0.0
             cpu["ghz"] = ghz
-            cpu["processes"] = int(pdh.value("procs") or 0) if pdh else len(psutil.pids())
+            procs = pdh.value("procs") if pdh else None
+            cpu["processes"] = int(procs) if procs else len(psutil.pids())
             cpu["threads"] = int(pdh.value("threads")) if pdh and pdh.value("threads") else None
             cpu["handles"] = int(pdh.value("handles")) if pdh and pdh.value("handles") else None
 
@@ -931,29 +946,33 @@ class MetricsThread(QThread):
                         "working_set": int(pdh.value("wset")) if pdh and pdh.value("wset") else None}
 
             # ---- disks (throughput + capacity per physical disk)
-            cur_disk = psutil.disk_io_counters(perdisk=True)
-            for key, io in cur_disk.items():
-                m = re.search(r"(\d+)$", key)
-                if not m:
-                    continue
-                idx = int(m.group(1))
-                p = prev_disk.get(key)
-                rd = (io.read_bytes - p.read_bytes) / dt if p else 0.0
-                wr = (io.write_bytes - p.write_bytes) / dt if p else 0.0
-                used = total = None
-                mounts = self.disk_map.get(idx) or []
-                if mounts:
-                    used = total = 0
-                    for mp in mounts:
-                        try:
-                            u = psutil.disk_usage(mp)
-                            used += u.used
-                            total += u.total
-                        except Exception:
-                            pass
-                d["disks"][idx] = {"read_bps": max(0.0, rd), "write_bps": max(0.0, wr),
-                                   "used": used, "total": total}
-            prev_disk = cur_disk
+            try:
+                cur_disk = psutil.disk_io_counters(perdisk=True)
+                for key, io in cur_disk.items():
+                    m = re.search(r"(\d+)$", key)
+                    if not m:
+                        continue
+                    idx = int(m.group(1))
+                    p = prev_disk.get(key)
+                    rd = (io.read_bytes - p.read_bytes) / dt if p else 0.0
+                    wr = (io.write_bytes - p.write_bytes) / dt if p else 0.0
+                    used = total = None
+                    mounts = self.disk_map.get(idx) or []
+                    if mounts:
+                        used = total = 0
+                        for mp in mounts:
+                            try:
+                                u = psutil.disk_usage(mp)
+                                used += u.used
+                                total += u.total
+                            except Exception:
+                                pass
+                    d["disks"][idx] = {"read_bps": max(0.0, rd),
+                                       "write_bps": max(0.0, wr),
+                                       "used": used, "total": total}
+                prev_disk = cur_disk
+            except Exception:
+                pass   # transient counter glitches must not kill the sampler
 
             # ---- GPU adapter memory usage
             for i in range(len(gpu_insts)):
@@ -963,31 +982,37 @@ class MetricsThread(QThread):
                                   "shared_used": int(sha) if sha is not None else None})
 
             # ---- network
-            cur_net = psutil.net_io_counters(pernic=True)
             try:
+                cur_net = psutil.net_io_counters(pernic=True)
                 stats = psutil.net_if_stats()
                 addrs = psutil.net_if_addrs()
+                for name, st in stats.items():
+                    if not st.isup:
+                        continue
+                    low = name.lower()
+                    if "loopback" in low or low.startswith("lo"):
+                        continue
+                    ip4 = ip6 = ip6_ll = None
+                    for a in addrs.get(name, []):
+                        if a.family == socket.AF_INET and not ip4:
+                            ip4 = a.address
+                        elif a.family == socket.AF_INET6:
+                            addr = a.address.split("%")[0]
+                            if addr.lower().startswith("fe80"):
+                                ip6_ll = ip6_ll or addr
+                            elif not ip6:
+                                ip6 = addr
+                    ip6 = ip6 or ip6_ll   # prefer global over link-local
+                    io, p = cur_net.get(name), prev_net.get(name)
+                    up = (io.bytes_sent - p.bytes_sent) * 8 / dt if io and p else 0.0
+                    dn = (io.bytes_recv - p.bytes_recv) * 8 / dt if io and p else 0.0
+                    d["nets"][name] = {"ip4": ip4, "ip6": ip6,
+                                       "up_bps": max(0.0, up),
+                                       "down_bps": max(0.0, dn),
+                                       "speed_mbps": st.speed}
+                prev_net = cur_net
             except Exception:
-                stats, addrs = {}, {}
-            for name, st in stats.items():
-                if not st.isup:
-                    continue
-                low = name.lower()
-                if "loopback" in low or low.startswith("lo"):
-                    continue
-                ip4 = ip6 = None
-                for a in addrs.get(name, []):
-                    if a.family == socket.AF_INET and not ip4:
-                        ip4 = a.address
-                    elif a.family == socket.AF_INET6 and not ip6:
-                        ip6 = a.address.split("%")[0]
-                io, p = cur_net.get(name), prev_net.get(name)
-                up = (io.bytes_sent - p.bytes_sent) * 8 / dt if io and p else 0.0
-                dn = (io.bytes_recv - p.bytes_recv) * 8 / dt if io and p else 0.0
-                d["nets"][name] = {"ip4": ip4, "ip6": ip6,
-                                   "up_bps": max(0.0, up), "down_bps": max(0.0, dn),
-                                   "speed_mbps": st.speed}
-            prev_net = cur_net
+                pass   # transient counter glitches must not kill the sampler
             prev_t = now
 
             # ---- TCP connections (established + listening, per refresh)
@@ -1401,12 +1426,16 @@ class SecurityThread(QThread):
             if pid is None or pid <= 4:
                 continue
             try:
-                h = win32api.OpenProcess(
-                    win32con.PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+                # 0x1000 = PROCESS_QUERY_LIMITED_INFORMATION (the named
+                # constant is missing from some pywin32 releases)
+                h = win32api.OpenProcess(0x1000, False, pid)
                 try:
                     tok = win32security.OpenProcessToken(h, win32con.TOKEN_QUERY)
-                    elevated = bool(win32security.GetTokenInformation(
-                        tok, win32security.TokenElevation))
+                    try:
+                        elevated = bool(win32security.GetTokenInformation(
+                            tok, win32security.TokenElevation))
+                    finally:
+                        tok.Close()
                 finally:
                     h.Close()
             except Exception:
@@ -1534,9 +1563,9 @@ class SecurityLogsThread(QThread):
 
 def _nice_ceiling(v):
     """Smallest 1/2/5 * 10^k that is >= v (for graph autoscaling)."""
-    if v <= 0:
-        return 1.0
     import math
+    if not math.isfinite(v) or v <= 0:
+        return 1.0
     exp = math.floor(math.log10(v))
     for mult in (1, 2, 5, 10):
         cand = mult * (10 ** exp)
@@ -1557,7 +1586,12 @@ class LineGraph(QWidget):
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
     def add_point(self, v):
-        self.points.append(max(0.0, float(v or 0.0)))
+        import math
+        try:
+            v = float(v or 0.0)
+        except (TypeError, ValueError):
+            v = 0.0
+        self.points.append(max(0.0, v) if math.isfinite(v) else 0.0)
         self.update()
 
     def paintEvent(self, ev):
@@ -1744,13 +1778,17 @@ class GitHubButton(QPushButton):
 
 
 def launch_windows_tool(parent, *cmd):
-    """Start a Windows built-in tool (resolved from System32 when possible)."""
+    """Start a Windows built-in tool, resolved only from the Windows
+    directories — never through PATH, since this process runs elevated."""
     try:
-        sys32 = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "System32")
-        exe = os.path.join(sys32, cmd[0])
-        if not os.path.exists(exe):
-            exe = cmd[0]
-        subprocess.Popen([exe, *cmd[1:]])
+        windir = os.environ.get("SystemRoot", r"C:\Windows")
+        for base in (os.path.join(windir, "System32"), windir):
+            exe = os.path.join(base, cmd[0])
+            if os.path.exists(exe):
+                subprocess.Popen([exe, *cmd[1:]])
+                return
+        raise FileNotFoundError(
+            f"{cmd[0]} was not found in the Windows directories")
     except Exception as e:
         QMessageBox.critical(parent, APP_NAME, f"Could not open {cmd[0]}:\n{e}")
 
@@ -1993,6 +2031,7 @@ class HardwareTab(QWidget):
         total = ded_total + self.shared_total
         g.set("Total GPU memory", fmt_bytes(total))
         self.gpu_cards.append({"grid": g, "graph": graph,
+                               "name": spec["name"],
                                "ded_total": ded_total,
                                "shared_total": self.shared_total})
         return card
@@ -2091,9 +2130,15 @@ class HardwareTab(QWidget):
             if total and ded is not None:
                 pct = ((ded or 0) + (sha or 0)) / total * 100.0
                 gc["graph"].add_point(pct)
-            if i < len(gpu_temps):
-                g.set_visible("Temperature", True)
-                g.set("Temperature", f"{gpu_temps[i]} °C")
+        # nvidia-smi reports NVIDIA adapters only, in NVIDIA order — map its
+        # temps onto the NVIDIA cards, not blindly onto every adapter
+        if gpu_temps:
+            nvidia = [gc for gc in self.gpu_cards
+                      if "nvidia" in gc["name"].lower()]
+            for j, gc in enumerate(nvidia):
+                if j < len(gpu_temps):
+                    gc["grid"].set_visible("Temperature", True)
+                    gc["grid"].set("Temperature", f"{gpu_temps[j]} °C")
         for idx, dc in self.disk_cards.items():
             s = (d.get("disks") or {}).get(idx)
             if not s:
@@ -2155,6 +2200,7 @@ class NetworkTab(QWidget):
         super().__init__(parent)
         self.net_specs = {}
         self._last_nets = {}
+        self._last_conns = {}
         v = QVBoxLayout(self)
         v.setContentsMargins(18, 14, 18, 18)
         v.setSpacing(12)
@@ -2272,6 +2318,9 @@ class NetworkTab(QWidget):
         page = self.pages.get(name)
         if page:
             self.stack.setCurrentWidget(page["widget"])
+            s = self._last_nets.get(name)   # fill immediately, don't wait a tick
+            if s:
+                self._update_conn_tables(page, s, self._last_conns)
 
     def update_metrics(self, d):
         nets = d.get("nets") or {}
@@ -2298,6 +2347,7 @@ class NetworkTab(QWidget):
             if row < 0:
                 self.stack.setCurrentWidget(self._placeholder)
         conns = d.get("conns") or {}
+        self._last_conns = conns
         for name, s in nets.items():
             page = self.pages.get(name)
             if not page:
@@ -2481,7 +2531,10 @@ class EventTablePanel(QWidget):
         'keys' (sort keys), 'dt', optional 'color' (col 1) and 'export'.
         Checked rows and the active sort survive periodic refreshes."""
         t = self.table
+        uids = [self._row_uid(row) for row in rows]
         if getattr(self, "_loaded", False):
+            if uids == getattr(self, "_last_uids", None):
+                return   # nothing changed: skip the (expensive) refill
             hdr = t.horizontalHeader()
             sort_col = hdr.sortIndicatorSection()
             sort_ord = hdr.sortIndicatorOrder()
@@ -2489,6 +2542,7 @@ class EventTablePanel(QWidget):
                 sort_col, sort_ord = self.date_col, Qt.SortOrder.DescendingOrder
         else:
             sort_col, sort_ord = self.date_col, Qt.SortOrder.DescendingOrder
+        self._last_uids = uids
         checked = set()
         for r in range(t.rowCount()):
             it = t.item(r, 0)
@@ -2586,9 +2640,12 @@ class EventTablePanel(QWidget):
         newest = max(r["dt"] for r in rows)   # from the "Date and Time" column
         filename = (self.export_prefix
                     + newest.strftime("%Y-%m-%d_%H-%M-%S") + ".txt")
+        def clean(x):   # keep the tab-separated columns intact
+            return re.sub(r"[\t\r\n]+", " ", str(x))
+
         lines = ["\t".join(self.headers[1:])]
         for r in rows:
-            lines.append("\t".join(str(x) for x in r.get("export", r["cells"])))
+            lines.append("\t".join(clean(x) for x in r.get("export", r["cells"])))
         try:
             directory = self.get_dir()
             os.makedirs(directory, exist_ok=True)
@@ -2680,9 +2737,14 @@ class SecurityTab(QWidget):
     def __init__(self, get_dir, parent=None):
         super().__init__(parent)
         self.get_dir = get_dir
-        self._thread = None
-        self._log_thread = None
         self._fw_available = False
+        # persistent worker threads (restarted with .start(); creating a new
+        # QThread per refresh would leak thread objects at every interval)
+        self._thread = SecurityThread(self)
+        self._thread.progress.connect(self._on_progress)
+        self._thread.ready.connect(self.set_data)
+        self._log_thread = SecurityLogsThread(self)
+        self._log_thread.loaded.connect(self._on_logs_refreshed)
         v = QVBoxLayout(self)
         v.setContentsMargins(18, 14, 18, 18)
         v.setSpacing(12)
@@ -2816,25 +2878,18 @@ class SecurityTab(QWidget):
     # ---- data -----------------------------------------------------------
     def refresh(self):
         """Full security sweep, shown behind the centered loading view."""
-        if self._thread is not None and self._thread.isRunning():
+        if self._thread.isRunning():
             return
         self.loading_label.setText("Loading security information…")
         self.progress_bar.setValue(0)
         self.percent_label.setText("0%")
         self.stack.setCurrentIndex(0)
-        self._thread = SecurityThread(self)
-        self._thread.progress.connect(self._on_progress)
-        self._thread.ready.connect(self.set_data)
         self._thread.start()
 
     def refresh_logs_only(self):
         """Timer-driven re-read of the Security log list alone."""
-        if self._thread is not None and self._thread.isRunning():
+        if self._thread.isRunning() or self._log_thread.isRunning():
             return
-        if self._log_thread is not None and self._log_thread.isRunning():
-            return
-        self._log_thread = SecurityLogsThread(self)
-        self._log_thread.loaded.connect(self._on_logs_refreshed)
         self._log_thread.start()
 
     def _on_logs_refreshed(self, events, blocked):
@@ -2850,7 +2905,7 @@ class SecurityTab(QWidget):
 
     def shutdown(self):
         for th in (self._thread, self._log_thread):
-            if th is not None and th.isRunning():
+            if th.isRunning():
                 th.wait(3000)
 
     def _set_log_rows(self, events):
@@ -3033,7 +3088,7 @@ class SettingsTab(QWidget):
         row.addWidget(self.refresh_edit)
         dc.v.addLayout(row)
         row = QHBoxLayout()
-        lab = QLabel("Logs refresh rate in milliseconds) (applies to the log "
+        lab = QLabel("Logs refresh rate in milliseconds (applies to the log "
                      "lists in the Logs and Security tabs)")
         lab.setObjectName("dim")
         lab.setWordWrap(True)
@@ -3116,8 +3171,8 @@ class SettingsTab(QWidget):
         self.changed.emit()
 
     def _logs_refresh_changed(self):
-        try:
-            self.s["logs_refresh_ms"] = max(100, int(self.logs_refresh_edit.text()))
+        try:  # 500 ms floor: each refresh re-reads 1000+ events from the OS
+            self.s["logs_refresh_ms"] = max(500, int(self.logs_refresh_edit.text()))
         except ValueError:
             pass
         self.logs_refresh_edit.setText(str(self.s["logs_refresh_ms"]))
@@ -3147,7 +3202,7 @@ class SettingsTab(QWidget):
         except ValueError:
             pass
         try:
-            self.s["logs_refresh_ms"] = max(100, int(self.logs_refresh_edit.text()))
+            self.s["logs_refresh_ms"] = max(500, int(self.logs_refresh_edit.text()))
         except ValueError:
             pass
 
@@ -3224,7 +3279,9 @@ class MainWindow(QMainWindow):
         self.metrics.start()
 
         # ---- log refresh: initial load + user-defined interval + manual button
-        self._logs_thread = None
+        # one persistent thread, restarted per refresh (no per-tick QThread churn)
+        self._logs_thread = LogsThread(self)
+        self._logs_thread.loaded.connect(self.logs_tab.set_logs)
         self._refresh_logs()
         self.logs_tab.refresh_btn.clicked.connect(self._refresh_logs)
         self.logs_timer = QTimer(self)
@@ -3241,14 +3298,11 @@ class MainWindow(QMainWindow):
 
     # ---- data plumbing --------------------------------------------------
     def _refresh_logs(self):
-        if self._logs_thread is not None and self._logs_thread.isRunning():
-            return
-        self._logs_thread = LogsThread(self)
-        self._logs_thread.loaded.connect(self.logs_tab.set_logs)
-        self._logs_thread.start()
+        if not self._logs_thread.isRunning():
+            self._logs_thread.start()
 
     def _apply_log_timers(self):
-        ms = max(100, int(self.s["logs_refresh_ms"]))
+        ms = max(500, int(self.s["logs_refresh_ms"]))
         self.logs_timer.start(ms)
         self.seclog_timer.start(ms)
 
@@ -3335,13 +3389,36 @@ class MainWindow(QMainWindow):
         self.metrics.wait(3000)
         self.security_tab.shutdown()
         for th in (self.specs_thread, self._logs_thread):
-            if th is not None and th.isRunning():
-                th.wait(1000)
+            if th.isRunning():
+                th.wait(3000)
         super().closeEvent(ev)
+
+
+def _install_excepthook():
+    """Without a custom hook, PyQt6 aborts the whole process on any unhandled
+    exception inside a slot. Log it, tell the user once, keep running."""
+    notified = []
+
+    def hook(tp, val, tb):
+        import traceback
+        print("".join(traceback.format_exception(tp, val, tb)), file=sys.stderr)
+        if not notified:
+            notified.append(True)
+            try:
+                if QApplication.instance() is not None:
+                    QMessageBox.critical(
+                        None, APP_NAME,
+                        "An unexpected error occurred. The application will "
+                        f"continue running.\n\n{tp.__name__}: {val}")
+            except Exception:
+                pass
+
+    sys.excepthook = hook
 
 
 def main():
     ensure_admin()
+    _install_excepthook()
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(APP_VERSION)
